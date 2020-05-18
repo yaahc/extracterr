@@ -64,7 +64,7 @@
 //! use extracterr::{Bundle, Bundled};
 //!
 //! #[derive(Debug, thiserror::Error)]
-//! #[error("{kind}")]
+//! #[error(transparent)]
 //! struct Error {
 //!     kind: Bundled<Kind, Backtrace>,
 //! }
@@ -102,6 +102,30 @@
 //! fn dequeue() -> Result<(), Error> {
 //!     Err(Kind::Dequeue).bundle(Backtrace::new())?
 //! }
+//!
+//! use extracterr::Extract;
+//!
+//! let error = dequeue().unwrap_err();
+//!
+//! // Convert it to a trait object to throw away type information
+//! let error: Box<dyn std::error::Error + Send + Sync + 'static> = error.into();
+//!
+//! // first error in chain is the unerased version of the error `Bundled<ExampleError, Backtrace>`
+//! assert!(error.downcast_ref::<Error>().is_some());
+//! assert_eq!("could not dequeue item", error.to_string());
+//! assert!(error.extract::<Backtrace>().is_none());
+//!
+//! // Move to the next error in the chain
+//! let error = error.source().unwrap();
+//!
+//! // The second error in the chain is the erased version `Bundled<Erased, Backtrace>` which now
+//! // works with downcasting, letting us access the bundled context
+//! let backtrace = error.extract::<Backtrace>();
+//! assert!(backtrace.is_some());
+//!
+//! // The Display / Debug impls of the fake error that contains the bundled context print the
+//! // context's type_name
+//! assert_eq!(error.to_string(), std::any::type_name::<Backtrace>());
 //! ```
 //!
 //! Once context has been bundled into a chain of errors it can then be extracted back out via the
@@ -112,7 +136,7 @@
 //! [`Bundled`]: struct.Bundled.html
 //! [`Extract`]: trait.Extract.html
 //! [`stable-eyre`]: https://github.com/yaahc/stable-eyre
-#![doc(html_root_url = "https://docs.rs/extracterr/0.1.0")]
+#![doc(html_root_url = "https://docs.rs/extracterr/0.1.1")]
 #![warn(
     missing_debug_implementations,
     missing_docs,
