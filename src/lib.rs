@@ -1,5 +1,11 @@
-//! This crate provides helpers for bundling context with errors and later
-//! extracting said context thru `dyn Error` trait objects.
+//! Helpers for bundling context with errors and later extracting said context thru `dyn Error`
+//! trait objects.
+//!
+//! The primary purpose of this crate is to pass context to error reporters through `dyn Error`
+//! trait objects. This is useful for information that may need to be captured by leaf errors but
+//! which doesn't belong in any single error's message. Backtraces, http status codes, and help
+//! messages are all examples of context that one might wish to pass directly to an error reporter
+//! rather than printing in the chain of errors.
 //!
 //! ## Setup
 //!
@@ -8,7 +14,7 @@
 //! extracterr = "0.1"
 //! ```
 //!
-//! ## Example
+//! ## TLDR Example
 //!
 //! ```rust
 //! use backtrace::Backtrace;
@@ -20,21 +26,92 @@
 //! struct ExampleError;
 //!
 //! let error = ExampleError;
+//!
+//! // Capture a backtrace via `Default` and `From`
 //! let error: Bundled<_, Backtrace> = error.into();
+//!
+//! // Convert it to a trait object to throw away type information
 //! let error: Box<dyn Error + Send + Sync + 'static> = error.into();
 //!
-//! // first error in chain should be the error itself
+//! // first error in chain is the unerased version of the error `Bundled<ExampleError, Backtrace>`
+//! assert!(error.downcast_ref::<Bundled<ExampleError, Backtrace>>().is_some());
 //! assert_eq!("Example Error", error.to_string());
 //! assert!(error.extract::<Backtrace>().is_none());
 //!
+//! // Move to the next error in the chain
 //! let error = error.source().unwrap();
-//! let backtrace = error.extract::<Backtrace>();
 //!
+//! // The second error in the chain is the erased version `Bundled<Erased, Backtrace>` which now
+//! // works with downcasting, letting us access the bundled context
+//! let backtrace = error.extract::<Backtrace>();
 //! assert!(backtrace.is_some());
+//!
 //! // The Display / Debug impls of the fake error that contains the bundled context print the
 //! // context's type_name
 //! assert_eq!(error.to_string(), std::any::type_name::<Backtrace>());
 //! ```
+//!
+//! ## Details
+//!
+//! The main type provided by this library is the `Bundled` type, which bundles an error and a
+//! context type into a new error. This type can be constructed either via `From+Default` or
+//! [`Bundle`], for more details check out the docs on [`Bundled`].
+//!
+//! This type works best with the error kind pattern, as seen in `std::io::Error`:
+//!
+//! ```rust
+//! use backtrace::Backtrace;
+//! use extracterr::{Bundle, Bundled};
+//!
+//! #[derive(Debug, thiserror::Error)]
+//! #[error("{kind}")]
+//! struct Error {
+//!     kind: Bundled<Kind, Backtrace>,
+//! }
+//!
+//! #[derive(Debug, thiserror::Error, Clone, Copy)]
+//! enum Kind {
+//!     #[error("could not enqueue item")]
+//!     Queue,
+//!     #[error("could not dequeue item")]
+//!     Dequeue
+//! }
+//!
+//! impl Error {
+//!     fn kind(&self) -> Kind {
+//!         *self.kind.inner()
+//!     }
+//! }
+//!
+//! impl From<Kind> for Error {
+//!     fn from(kind: Kind) -> Self {
+//!         Self { kind: Bundled::from(kind) }
+//!     }
+//! }
+//!
+//! impl From<Bundled<Kind, Backtrace>> for Error {
+//!     fn from(kind: Bundled<Kind, Backtrace>) -> Self {
+//!         Self { kind }
+//!     }
+//! }
+//!
+//! fn queue() -> Result<(), Error> {
+//!     Err(Kind::Queue)?
+//! }
+//!
+//! fn dequeue() -> Result<(), Error> {
+//!     Err(Kind::Dequeue).bundle(Backtrace::new())?
+//! }
+//! ```
+//!
+//! Once context has been bundled into a chain of errors it can then be extracted back out via the
+//! [`Extract`] trait. Check out the source code of [`stable-eyre`] for a simple example of
+//! idiomatic usage of `Extract` in an error reporter.
+//!
+//! [`Bundle`]: trait.Bundle.html
+//! [`Bundled`]: struct.Bundled.html
+//! [`Extract`]: trait.Extract.html
+//! [`stable-eyre`]: https://github.com/yaahc/stable-eyre
 #![doc(html_root_url = "https://docs.rs/extracterr/0.1.0")]
 #![warn(
     missing_debug_implementations,
@@ -64,7 +141,61 @@ use std::fmt::{self, Debug, Display};
 
 struct Erased;
 
+/// An Error bundled with a Context can then later be extracted from a chain of dyn Errors.
 ///
+/// # Usage
+///
+/// This type has two primary methods of construction, `From` and [`Bundle`]. The first method of
+/// construction, the `From` trait, only works when the type you're bundling with the error
+/// implements `Default`. This is useful for types like `Backtrace`s where the context you care
+/// about is implicitly captured just by constructing the type, or for types that have a reasonable
+/// default like HttpStatusCodes defaulting to 500.
+///
+/// ```
+/// use extracterr::Bundled;
+///
+/// #[derive(Debug, thiserror::Error)]
+/// #[error("just an example error")]
+/// struct ExampleError;
+///
+/// struct StatusCode(u32);
+///
+/// impl Default for StatusCode {
+///     fn default() -> Self {
+///         Self(500)
+///     }
+/// }
+///
+///
+/// fn foo() -> Result<(), Bundled<ExampleError, StatusCode>> {
+///     Err(ExampleError)?
+/// }
+/// ```
+///
+/// The second method of construction, the [`Bundle`] trait, lets you attach context to errors
+/// manually. This is useful for types that don't implement `Default` or types where you only
+/// occasionally want to override the defaults.
+///
+/// ```
+/// use extracterr::{Bundled, Bundle};
+///
+/// #[derive(Debug, thiserror::Error)]
+/// #[error("just an example error")]
+/// struct ExampleError;
+///
+/// struct StatusCode(u32);
+///
+/// fn foo() -> Result<(), Bundled<ExampleError, StatusCode>> {
+///     Err(ExampleError).bundle(StatusCode(404))?
+/// }
+/// ```
+///
+/// Once context has been bundled with an error it can then be extracted by an error reporter with
+/// the [`Extract`] trait.
+///
+/// [`Bundle`]: trait.Bundle.html
+/// [`Bundled`]: struct.Bundled.html
+/// [`Extract`]: trait.Extract.html
 pub struct Bundled<E, C: 'static> {
     inner: ErrorImpl<E, C>,
 }
@@ -96,6 +227,11 @@ impl<E, C: 'static> Bundled<E, C> {
                 error,
             },
         }
+    }
+
+    /// Returns a reference to the inner error
+    pub fn inner(&self) -> &E {
+        &self.inner.error
     }
 }
 
@@ -208,30 +344,22 @@ impl<C> Display for ErrorImpl<Erased, C> {
     }
 }
 
-///
+/// Extension trait for bundling context with errors through `Result` types
 pub trait Bundle<T, C> {
-    ///
+    /// The output error type after bundling with the provided context
     type Bundled;
 
     /// ```
     /// use extracterr::{Bundle, Bundled};
+    ///
+    /// struct Dummy(i32);
     ///
     /// fn do_thing() -> Result<(), std::io::Error> {
     ///     // ...
     ///     # Ok(())
     /// }
     ///
-    ///
-    /// #[derive(Debug)]
-    /// struct Dummy(i32);
-    ///
-    /// impl std::fmt::Display for Dummy {
-    ///     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    ///         write!(f, "{}", self.0)
-    ///     }
-    /// }
-    ///
-    /// let r: Result<(), Bundled<std::io::Error, Dummy>> = do_thing().bundle(Dummy(0));
+    /// let r = do_thing().bundle(Dummy(0)); //: Result<(), Bundled<std::io::Error, Dummy>>
     /// ```
     fn bundle(self, context: C) -> Result<T, Self::Bundled>;
 }
@@ -248,9 +376,36 @@ where
     }
 }
 
-///
+/// Extension trait for extracting references to bundled context from `dyn Error` trait objects
 pub trait Extract {
+    /// # Example
     ///
+    /// ```rust
+    /// use std::error::Error;
+    /// use backtrace::Backtrace;
+    /// use extracterr::{Bundled, Extract};
+    ///
+    /// fn report(error: &(dyn Error + 'static)) {
+    ///     let mut source = Some(error);
+    ///     let mut ind = 0;
+    ///     let mut backtrace = None;
+    ///
+    ///     while let Some(error) = source {
+    ///         source = error.source();
+    ///
+    ///         if let Some(bt) = error.extract::<Backtrace>() {
+    ///             backtrace = Some(bt);
+    ///         } else {
+    ///             println!("{}: {}", ind, error);
+    ///             ind += 1;
+    ///         }
+    ///     }
+    ///
+    ///     if let Some(backtrace) = backtrace {
+    ///         println!("\nBacktrace:\n{:?}", backtrace)
+    ///     }
+    /// }
+    /// ```
     fn extract<C>(&self) -> Option<&C>
     where
         C: 'static;
